@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Speed Probability (char1 slower)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; padding: 20px; max-width:900px; }
+    label { display:block; margin-top:10px; }
+    input[type="number"] { width:140px; }
+    button { margin-top:10px; }
+    pre { background:#f6f8fa; padding:12px; border-radius:6px; overflow:auto; }
+    #progress { margin-top:6px; }
+  </style>
+</head>
+<body>
+  <h1>Speed Probability — キャラ1がキャラ2より遅い確率</h1>
+  <p>各キャラのスピードに 0.975〜1.025 の一様乱数を掛けたとき、キャラ1がキャラ2より遅く動く確率をブラウザで計算します。</p>
+
+  <label>
+    キャラ1の基礎スピード: <input id="speed1" type="number" value="2839" step="1" />
+  </label>
+  <label>
+    キャラ2の基礎スピード: <input id="speed2" type="number" value="2783" step="1" />
+  </label>
+
+  <div style="margin-top:12px;">
+    <button id="btnAnalytic">解析（厳密）で計算</button>
+    <span id="analyticResult" style="margin-left:12px"></span>
+  </div>
+
+  <div style="margin-top:12px;">
+    <label>
+      モンテカルロ サンプル数: <input id="mcSamples" type="number" value="1000000" step="1000" />
+    </label>
+    <button id="btnMC">モンテカルロで計算</button>
+    <button id="btnStop" disabled>停止</button>
+    <div id="progress"></div>
+    <div id="mcResult" style="margin-top:8px"></div>
+  </div>
+
+  <h2>実装の概要</h2>
+  <ul>
+    <li>解析解: 2次元長方形上の領域面積を計算（密度は定数なので面積比で確率を得る）</li>
+    <li>モンテカルロ: ブラウザの乱数でサンプリングし条件(s1 &lt; s2) の割合を数える。大きなサンプルは計算に時間がかかるため進捗を表示。</li>
+  </ul>
+
+  <h2>ログ</h2>
+  <pre id="log"></pre>
+
+<script>
+/* 解析解（面積計算）: 区間 x∈[a,b], y∈[c,d] に対して P(x < y) = area{(x,y): x∈[a,b], y∈[c,d], x<y} / ((b-a)*(d-c))
+   a = speed1*0.975, b = speed1*1.025, c = speed2*0.975, d = speed2*1.025
+*/
+function analyticProbability(speed1, speed2) {
+  const a = speed1 * 0.975;
+  const b = speed1 * 1.025;
+  const c = speed2 * 0.975;
+  const d = speed2 * 1.025;
+  const denom = (b - a) * (d - c);
+  if (denom <= 0) return 0.0;
+
+  const x0 = Math.min(b, d);
+  if (x0 <= a) return 0.0; // x 区間全体が d 以上 -> 面積 0
+
+  let area = 0.0;
+
+  // 区間 [a, min(c, x0)] では max(c,x)=c -> 積分値は (min(c,x0)-a)*(d-c)
+  if (a < c) {
+    const x1 = Math.min(c, x0);
+    if (x1 > a) area += (x1 - a) * (d - c);
+  }
+
+  // 区間 [max(a,c), x0] では integrand = d - x -> ∫ (d-x) dx = d*(x0-x2) - 0.5*(x0^2 - x2^2)
+  const x2 = Math.max(a, c);
+  if (x2 < x0) {
+    area += d * (x0 - x2) - 0.5 * (x0*x0 - x2*x2);
+  }
+
+  const prob = Math.max(0, Math.min(1, area / denom));
+  return prob;
+}
+
+function log(msg) {
+  const l = document.getElementById('log');
+  l.textContent = `${new Date().toLocaleTimeString()} ${msg}\n` + l.textContent;
+}
+
+// モンテカルロ（チャンク実行でUIロック緩和）
+let mcController = { running: false, stopRequested: false };
+
+async function monteCarloAsync(speed1, speed2, samples, chunk=100000, onProgress=null) {
+  mcController.running = true;
+  mcController.stopRequested = false;
+  let count = 0;
+  const rng = Math.random;
+  let slower = 0;
+  const scaleMin = 0.975, scaleMax = 1.025;
+  for (let done = 0; done < samples; done += chunk) {
+    if (mcController.stopRequested) break;
+    const thisChunk = Math.min(chunk, samples - done);
+    for (let i = 0; i < thisChunk; i++) {
+      const u1 = scaleMin + (scaleMax - scaleMin) * rng();
+      const u2 = scaleMin + (scaleMax - scaleMin) * rng();
+      const s1 = speed1 * u1;
+      const s2 = speed2 * u2;
+      if (s1 < s2) slower++;
+    }
+    count += thisChunk;
+    if (onProgress) onProgress(count, samples);
+    // 少し待って UI 更新を可能にする
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  mcController.running = false;
+  return { slower, count, probability: (count>0) ? (slower / count) : 0 };
+}
+
+document.getElementById('btnAnalytic').addEventListener('click', () => {
+  const s1 = Number(document.getElementById('speed1').value);
+  const s2 = Number(document.getElementById('speed2').value);
+  const p = analyticProbability(s1, s2);
+  const el = document.getElementById('analyticResult');
+  el.textContent = `P(char1 slower) = ${(p*100).toFixed(6)}%`;
+  log(`[analytic] speed1=${s1}, speed2=${s2}, p=${(p*100).toFixed(6)}%`);
+});
+
+document.getElementById('btnMC').addEventListener('click', async () => {
+  if (mcController.running) return;
+  const s1 = Number(document.getElementById('speed1').value);
+  const s2 = Number(document.getElementById('speed2').value);
+  let samples = Number(document.getElementById('mcSamples').value);
+  if (!Number.isFinite(samples) || samples <= 0) samples = 100000;
+  const progressEl = document.getElementById('progress');
+  const mcResEl = document.getElementById('mcResult');
+  document.getElementById('btnStop').disabled = false;
+  document.getElementById('btnMC').disabled = true;
+  progressEl.textContent = '開始...';
+  log(`[mc] start samples=${samples}, speed1=${s1}, speed2=${s2}`);
+
+  const start = performance.now();
+  try {
+    const res = await monteCarloAsync(s1, s2, samples, 100000, (done, total) => {
+      progressEl.textContent = `進捗: ${done.toLocaleString()} / ${total.toLocaleString()} (${(100*done/total).toFixed(2)}%)`;
+    });
+    const ms = Math.round(performance.now() - start);
+    mcResEl.textContent = `結果: P(char1 slower) ≈ ${(res.probability*100).toFixed(6)}%   (samples=${res.count}, time=${ms}ms)`;
+    log(`[mc] finish p=${(res.probability*100).toFixed(6)}% (samples=${res.count})`);
+  } catch (e) {
+    log(`[mc] error: ${e}`);
+  } finally {
+    document.getElementById('btnStop').disabled = true;
+    document.getElementById('btnMC').disabled = false;
+    progressEl.textContent = '';
+  }
+});
+
+document.getElementById('btnStop').addEventListener('click', () => {
+  if (!mcController.running) return;
+  mcController.stopRequested = true;
+  log('[mc] stop requested');
+});
+</script>
+</body>
+</html>
